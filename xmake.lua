@@ -4,6 +4,8 @@ target("REBEL")
 set_kind("binary")
 add_files("src/*.cpp")
 set_optimize('smallest')
+add_links('ncurses')
+add_links('miniupnpc')
 add_syslinks("pthread")
 --
 -- If you want to known more usage about xmake, please see https://xmake.io

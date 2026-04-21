@@ -1,5 +1,5 @@
 {
   "build": "xmake build",
-  "run": "xmake run REBEL server 192.168.0.104 1337",
+  "run": "xmake run REBEL server 0.0.0.0 1337",
   "clearOnBuild": "false"
 }
