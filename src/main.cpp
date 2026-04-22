@@ -28,9 +28,37 @@ std::atomic<std::chrono::steady_clock::time_point> last_seen;
 
 struct sockaddr_in remote_peer_addr;
 int global_sock = -1;
+std::atomic<int> active_upnp_port{-1};
 
 WINDOW *chat_bg, *chat_text, *input_bg, *input_text;
 std::mutex ui_mutex;
+
+void cleanup_upnp() {
+    int port = active_upnp_port.load();
+    if (port == -1) return;
+
+    int error = 0;
+    struct UPNPDev * devlist = upnpDiscover(2000, nullptr, nullptr, 0, 0, 2, &error);
+    if (!devlist) return;
+
+    struct UPNPUrls urls;
+    struct IGDdatas data;
+    char lanaddr[64] = {0};
+    char wanaddr[64] = {0};
+
+    int status = UPNP_GetValidIGD(devlist, &urls, &data, lanaddr, sizeof(lanaddr), wanaddr, sizeof(wanaddr));
+    if (status == 1 || status == 2) {
+        std::string port_str = std::to_string(port);
+        int r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype,
+                                       port_str.c_str(), "UDP", nullptr);
+        
+        if (r == UPNPCOMMAND_SUCCESS) {
+			std::cout << "Closed UPnP for port " << active_upnp_port.load() << std::endl;
+        }
+        FreeUPNPUrls(&urls);
+    }
+    freeUPNPDevlist(devlist);
+}
 
 void display_message(const std::string& user, const std::string& msg, int color_pair, bool save_to_file = true) {
 	std::lock_guard<std::mutex> lock(ui_mutex);
@@ -94,10 +122,11 @@ std::string get_ext_addr_via_stun(int sock) {
 	if (!server) return "ERROR";
 	memcpy(&servaddr.sin_addr.s_addr, server->h_addr, server->h_length);
 
+	// Magic cookie: 0x21 0x12 0xA4 0x42
 	unsigned char stun_request[] = {
-		0x00, 0x01, 0x00, 0x00, 
-		0x21, 0x12, 0xA4, 0x42, 
-		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c 
+		0x00, 0x01, 0x00, 0x00, // Binding Request
+		0x21, 0x12, 0xA4, 0x42, // Magic Cookie
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c // Transaction ID
 	};
 
 	sendto(sock, stun_request, sizeof(stun_request), 0, (struct sockaddr *)&servaddr, sizeof(servaddr));
@@ -114,15 +143,35 @@ std::string get_ext_addr_via_stun(int sock) {
 	tv = {0, 0}; 
 	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-	if (n > 20) {
-		for (int i = 20; i < n - 4; i++) {
-			if ((buffer[i] == 0x00 && buffer[i+1] == 0x01) || (buffer[i] == 0x00 && buffer[i+1] == 0x20)) {
+	if (n >= 20) {
+		int i = 20;
+		while (i < n - 3) {
+			uint16_t attr_type = (buffer[i] << 8) | buffer[i+1];
+			uint16_t attr_len  = (buffer[i+2] << 8) | buffer[i+3];
+
+			if (attr_type == 0x0001 && i + 4 + attr_len <= n) { 
 				int ext_port = (buffer[i+6] << 8) | buffer[i+7];
 				char ip_str[INET_ADDRSTRLEN];
 				if (inet_ntop(AF_INET, &buffer[i+8], ip_str, INET_ADDRSTRLEN)) {
 					return std::string(ip_str) + ":" + std::to_string(ext_port);
 				}
 			}
+			else if (attr_type == 0x0020 && i + 4 + attr_len <= n) { 
+				int ext_port = ((buffer[i+6] ^ 0x21) << 8) | (buffer[i+7] ^ 0x12);
+				
+				unsigned char ip_bytes[4];
+				ip_bytes[0] = buffer[i+8] ^ 0x21;
+				ip_bytes[1] = buffer[i+9] ^ 0x12;
+				ip_bytes[2] = buffer[i+10] ^ 0xA4;
+				ip_bytes[3] = buffer[i+11] ^ 0x42;
+
+				char ip_str[INET_ADDRSTRLEN];
+				if (inet_ntop(AF_INET, ip_bytes, ip_str, INET_ADDRSTRLEN)) {
+					return std::string(ip_str) + ":" + std::to_string(ext_port);
+				}
+			}
+
+			i += 4 + attr_len; 
 		}
 	}
 	return "UNKNOWN";
@@ -143,7 +192,7 @@ void setup_upnp(int port) {
 		std::string port_str = std::to_string(port);
 		UPNP_AddPortMapping(urls.controlURL, data.first.servicetype,
 				port_str.c_str(), port_str.c_str(), lanaddr, 
-				"REBEL-P2P", "UDP", nullptr, "0");
+				"REBEL-P2P", "UDP", nullptr, "60");
 		FreeUPNPUrls(&urls);
 	}
 	freeUPNPDevlist(devlist);
@@ -160,6 +209,7 @@ void udp_listen_loop() {
 				(struct sockaddr*)&src_addr, &addr_len);
 
 		if (n > 0) {
+			buffer[n] = '\0';
 			last_seen.store(std::chrono::steady_clock::now());
 			std::string msg(buffer);
 			if (msg.find("PUNCH:") == 0) {
@@ -233,11 +283,8 @@ void handle_command(const std::string& raw_input) {
 			return;
 		}
 
-		listening.store(true);
-		std::thread(udp_listen_loop).detach();
-		std::thread(check_timeout).detach();
-		setup_upnp(port);
-
+		// 1. СНАЧАЛА получаем STUN (пока никто не перехватывает пакеты)
+		display_message("System", "Resolving public IP via STUN...", 3);
 		std::string my_id = get_ext_addr_via_stun(global_sock);
 
 		if (my_id == "UNKNOWN") {
@@ -248,6 +295,15 @@ void handle_command(const std::string& raw_input) {
 				display_message("System", "Warning: Using HTTP IP. Port might be inaccurate if NAT is strict.", 3);
 			}
 		}
+
+		// 2. ТЕПЕРЬ запускаем слушающие потоки
+		listening.store(true);
+		std::thread(udp_listen_loop).detach();
+		std::thread(check_timeout).detach();
+		
+		// 3. UPnP запускаем в фоне, чтобы не морозить интерфейс ncurses
+		active_upnp_port.store(port);
+		std::thread(setup_upnp, port).detach();
 
 		display_message("System", "Listening on port " + arg1, 3);
 		display_message("System", "YOUR PUBLIC ID: " + my_id, 3);
@@ -329,6 +385,7 @@ void start_gui() {
 
 int main() {
 	start_gui();
+	cleanup_upnp();
 	if (global_sock != -1) close(global_sock);
 	return 0;
 }
