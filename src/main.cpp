@@ -4,7 +4,7 @@
 #include <thread>
 #include <cstring>
 #include <unistd.h>
-#include <atomic> // Добавлено для безопасной работы с сокетом между потоками
+#include <atomic>
 
 #include <miniupnpc/miniupnpc.h>
 #include <miniupnpc/upnpcommands.h>
@@ -20,7 +20,7 @@ std::string EXT_IP;
 // Разделяем окна на фоновые (для рамок) и текстовые (для контента)
 WINDOW *chat_bg, *chat_text, *input_bg, *input_text;
 std::mutex ui_mutex;
-std::atomic<int> active_socket{-1}; // Глобальный сокет текущего чата
+std::atomic<int> active_socket{-1};
 
 void display_message(const std::string& user, const std::string& msg, int color_pair) {
     std::lock_guard<std::mutex> lock(ui_mutex);
