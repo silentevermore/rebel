@@ -143,7 +143,7 @@ void setup_upnp(int port) {
 		std::string port_str = std::to_string(port);
 		UPNP_AddPortMapping(urls.controlURL, data.first.servicetype,
 				port_str.c_str(), port_str.c_str(), lanaddr, 
-				"P2P Messenger", "UDP", nullptr, "0");
+				"REBEL-P2P", "UDP", nullptr, "0");
 		FreeUPNPUrls(&urls);
 	}
 	freeUPNPDevlist(devlist);
