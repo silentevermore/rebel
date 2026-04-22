@@ -81,13 +81,21 @@ void init_voice_rx() {
 
 void voice_capture_thread() {
 	std::string rec_name = "RebelP2P_Rec_" + std::to_string(active_upnp_port);
-    pa_sample_spec ss;
-    ss.format = PA_SAMPLE_S16LE;
-    ss.channels = CHANNELS;
-    ss.rate = SAMPLE_RATE;
+
+	pa_sample_spec ss;
+	ss.format = PA_SAMPLE_S16LE;
+	ss.channels = CHANNELS;
+	ss.rate = SAMPLE_RATE;
+
+	pa_buffer_attr attr;
+	attr.maxlength = (uint32_t)-1;
+	attr.tlength = pa_usec_to_bytes(20 * 1000, &ss);
+	attr.prebuf = (uint32_t)-1;
+	attr.minreq = (uint32_t)-1;
+	attr.fragsize = pa_usec_to_bytes(20 * 1000, &ss);
 
     int error;
-    pa_capture = pa_simple_new(NULL, rec_name.c_str(), PA_STREAM_RECORD, NULL, "capture", &ss, NULL, NULL, &error);
+    pa_capture = pa_simple_new(NULL, rec_name.c_str(), PA_STREAM_RECORD, NULL, "capture", &ss, NULL, &attr, &error);
     
     OpusEncoder *encoder;
     encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION_VOIP, &error);
@@ -328,13 +336,16 @@ void udp_listen_loop() {
                     }
                 }
                 continue;
-            }
-            else if (type == 0x03) {
-                peer_voice_on.store(buffer[1] == 1);
-                refresh_status_bar();
-                continue;
-            }
-
+            } else if (type == 0x03) {
+				bool voice_state = (buffer[1] == 1);
+				peer_voice_on.store(voice_state);
+				if (!voice_state && pa_playback) {
+					int err;
+					pa_simple_flush(pa_playback, &err);
+				}
+				refresh_status_bar();
+				continue;
+			}
             buffer[n] = '\0';
             std::string msg(buffer);
 
