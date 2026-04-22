@@ -87,6 +87,17 @@ void display_message(const std::string& user, const std::string& msg, int color_
 	}
 }
 
+void heartbeat_loop() {
+    while (listening.load()) {
+        if (connected.load()) {
+            std::string ping = "KEEPALIVE_PING";
+            sendto(global_sock, ping.c_str(), ping.length(), 0, 
+                   (struct sockaddr*)&remote_peer_addr, sizeof(remote_peer_addr));
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+}
+
 void check_timeout() {
 	while (listening.load()) {
 		if (connected.load()) {
@@ -212,6 +223,15 @@ void udp_listen_loop() {
 			buffer[n] = '\0';
 			last_seen.store(std::chrono::steady_clock::now());
 			std::string msg(buffer);
+
+			if (msg == "KEEPALIVE_PING") {
+				sendto(global_sock, "KEEPALIVE_PONG", 14, 0, (struct sockaddr*)&src_addr, addr_len);
+				continue;
+			} 
+			else if (msg == "KEEPALIVE_PONG") {
+				continue;
+			}
+
 			if (msg.find("PUNCH:") == 0) {
 				if (msg.substr(6) == SECRET_KEY) {
 					remote_peer_addr = src_addr;
