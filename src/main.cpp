@@ -320,6 +320,7 @@ void handle_command(const std::string& raw_input) {
 		listening.store(true);
 		std::thread(udp_listen_loop).detach();
 		std::thread(check_timeout).detach();
+		std::thread(heartbeat_loop).detach();
 		
 		// 3. UPnP запускаем в фоне, чтобы не морозить интерфейс ncurses
 		active_upnp_port.store(port);
