@@ -1,3 +1,7 @@
+#define SAMPLE_RATE 48000
+#define FRAME_SIZE 960 // 20ms при 48kHz
+#define CHANNELS 1
+
 #include <cassert>
 #include <iostream>
 #include <string>
@@ -17,7 +21,17 @@
 #include <netdb.h>
 #include <sys/select.h>
 
+#include <opus/opus.h>
+
+#include <pulse/simple.h>
+#include <pulse/error.h>
+
 #include <ncurses.h>
+
+struct AudioPacket {
+    char type = 0x02;
+    unsigned char data[512];
+};
 
 const std::string HISTORY_FILE = "chat_history.log";
 const std::string SECRET_KEY = "REBEL_P2P_SECRET_HANDSHAKE_0X22";
@@ -26,12 +40,76 @@ std::atomic<bool> connected{false};
 std::atomic<bool> listening{false};
 std::atomic<std::chrono::steady_clock::time_point> last_seen;
 
+std::atomic<bool> my_voice_on{false};
+std::atomic<bool> peer_voice_on{false};
+
+std::atomic<int> max_x{0};
+std::atomic<int> max_y{0};
+
 struct sockaddr_in remote_peer_addr;
 int global_sock = -1;
 std::atomic<int> active_upnp_port{-1};
 
 WINDOW *chat_bg, *chat_text, *input_bg, *input_text;
 std::mutex ui_mutex;
+
+OpusDecoder *opus_decoder = nullptr;
+pa_simple *pa_capture = nullptr;
+pa_simple *pa_playback = nullptr;
+
+void init_voice_rx() {
+	std::string app_name = "RebelP2P_" + std::to_string(active_upnp_port);
+
+	pa_sample_spec ss;
+	ss.format = PA_SAMPLE_S16LE;
+	ss.channels = CHANNELS;
+	ss.rate = SAMPLE_RATE;
+
+	pa_buffer_attr attr;
+	attr.maxlength = (uint32_t)-1;
+	attr.tlength = pa_usec_to_bytes(20 * 1000, &ss);
+	attr.prebuf = (uint32_t)-1;
+	attr.minreq = (uint32_t)-1;
+	attr.fragsize = pa_usec_to_bytes(20 * 1000, &ss);
+
+    int error;
+	pa_playback = pa_simple_new(NULL, app_name.c_str(), PA_STREAM_PLAYBACK, NULL, "playback", &ss, NULL, &attr, &error);
+    
+    int opus_err;
+    opus_decoder = opus_decoder_create(SAMPLE_RATE, CHANNELS, &opus_err);
+}
+
+void voice_capture_thread() {
+	std::string rec_name = "RebelP2P_Rec_" + std::to_string(active_upnp_port);
+    pa_sample_spec ss;
+    ss.format = PA_SAMPLE_S16LE;
+    ss.channels = CHANNELS;
+    ss.rate = SAMPLE_RATE;
+
+    int error;
+    pa_capture = pa_simple_new(NULL, rec_name.c_str(), PA_STREAM_RECORD, NULL, "capture", &ss, NULL, NULL, &error);
+    
+    OpusEncoder *encoder;
+    encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION_VOIP, &error);
+
+    int16_t pcm_buffer[FRAME_SIZE];
+    unsigned char compressed[512];
+
+    while (listening.load()) {
+        if (my_voice_on.load() && connected.load() && pa_capture) {
+            if (pa_simple_read(pa_capture, pcm_buffer, sizeof(pcm_buffer), &error) < 0) continue;
+
+            int bytes_encoded = opus_encode(encoder, pcm_buffer, FRAME_SIZE, compressed + 1, 511);
+            if (bytes_encoded > 0) {
+                compressed[0] = 0x02;
+                sendto(global_sock, compressed, bytes_encoded + 1, 0, (struct sockaddr*)&remote_peer_addr, sizeof(remote_peer_addr));
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    if (pa_capture) pa_simple_free(pa_capture);
+}
 
 void cleanup_upnp() {
     int port = active_upnp_port.load();
@@ -58,6 +136,20 @@ void cleanup_upnp() {
         FreeUPNPUrls(&urls);
     }
     freeUPNPDevlist(devlist);
+}
+
+void refresh_status_bar() {
+    std::lock_guard<std::mutex> lock(ui_mutex);
+    int cur_y, cur_x;
+    getyx(input_text, cur_y, cur_x);
+
+    mvwprintw(chat_bg, 0, 2, "[ Voice: %s ]", my_voice_on ? "ON " : "OFF");
+    mvwprintw(chat_bg, 0, max_x.load() - 22, "[ Peer Voice: %s ]", peer_voice_on ? "ON " : "OFF");
+    
+    wnoutrefresh(chat_bg);
+    wmove(input_text, cur_y, cur_x);
+    wnoutrefresh(input_text);
+    doupdate();
 }
 
 void display_message(const std::string& user, const std::string& msg, int color_pair, bool save_to_file = true) {
@@ -210,51 +302,72 @@ void setup_upnp(int port) {
 }
 
 void udp_listen_loop() {
-	char buffer[2048];
-	struct sockaddr_in src_addr;
-	socklen_t addr_len = sizeof(src_addr);
+    char buffer[2048];
+    struct sockaddr_in src_addr;
+    socklen_t addr_len = sizeof(src_addr);
 
-	while (listening.load()) {
-		memset(buffer, 0, sizeof(buffer));
-		ssize_t n = recvfrom(global_sock, buffer, sizeof(buffer) - 1, 0, 
-				(struct sockaddr*)&src_addr, &addr_len);
+    while (listening.load()) {
+        ssize_t n = recvfrom(global_sock, buffer, sizeof(buffer) - 1, 0, 
+                (struct sockaddr*)&src_addr, &addr_len);
 
-		if (n > 0) {
-			buffer[n] = '\0';
-			last_seen.store(std::chrono::steady_clock::now());
-			std::string msg(buffer);
+        if (n > 0) {
+            last_seen.store(std::chrono::steady_clock::now());
+            unsigned char type = buffer[0];
+            
+            if (type == 0x01) {
+                display_message("Friend", std::string(buffer + 1, n - 1), 1);
+                continue; 
+            } 
+            else if (type == 0x02) {
+                if (peer_voice_on.load() && opus_decoder && pa_playback) {
+                    int16_t out_pcm[FRAME_SIZE];
+                    int samples = opus_decode(opus_decoder, (unsigned char*)buffer + 1, n - 1, out_pcm, FRAME_SIZE, 0);
+                    if (samples > 0) {
+                        int pa_err;
+                        pa_simple_write(pa_playback, out_pcm, samples * sizeof(int16_t), &pa_err);
+                    }
+                }
+                continue;
+            }
+            else if (type == 0x03) {
+                peer_voice_on.store(buffer[1] == 1);
+                refresh_status_bar();
+                continue;
+            }
 
-			if (msg == "KEEPALIVE_PING") {
-				sendto(global_sock, "KEEPALIVE_PONG", 14, 0, (struct sockaddr*)&src_addr, addr_len);
+            buffer[n] = '\0';
+            std::string msg(buffer);
+
+            if (msg == "KEEPALIVE_PING") {
+                sendto(global_sock, "KEEPALIVE_PONG", 14, 0, (struct sockaddr*)&src_addr, addr_len);
+				continue;
+			} else if (msg == "KEEPALIVE_PONG") {
 				continue;
 			} 
-			else if (msg == "KEEPALIVE_PONG") {
+            else if (msg.find("PUNCH:") == 0) {
+                if (msg.substr(6) == SECRET_KEY) {
+                    remote_peer_addr = src_addr;
+                    if (!connected.load()) {
+                        connected.store(true);
+                        sendto(global_sock, "PUNCH_ACK", 9, 0, (struct sockaddr*)&src_addr, addr_len);
+                        display_message("System", "Handshake received! Connected.", 3);
+                    }
+                }
 				continue;
-			}
-
-			if (msg.find("PUNCH:") == 0) {
-				if (msg.substr(6) == SECRET_KEY) {
-					remote_peer_addr = src_addr;
-					if (!connected.load()) {
-						connected.store(true);
-						sendto(global_sock, "PUNCH_ACK", 9, 0, (struct sockaddr*)&src_addr, addr_len);
-						display_message("System", "Handshake received! Connected.", 3);
-					}
-				}
-			} 
-			else if (msg == "PUNCH_ACK") {
-				remote_peer_addr = src_addr;
-				if (!connected.load()) {
-					connected.store(true);
-					display_message("System", "Handshake ACK! Connected.", 3);
-				}
-			}
-			else if (connected.load()) {
-				remote_peer_addr = src_addr;
-				display_message("Friend", msg, 1); 
-			}   
-		}
-	}
+            } 
+            else if (msg == "PUNCH_ACK") {
+                remote_peer_addr = src_addr;
+                if (!connected.load()) {
+                    connected.store(true);
+                    display_message("System", "Handshake ACK! Connected.", 3);
+                }
+				continue;
+            }
+            else if (connected.load() && type > 0x1F) { 
+                display_message("Friend", msg, 1); 
+            }   
+        }
+    }
 }
 
 void punch_and_connect(std::string ip, int port) {
@@ -303,7 +416,9 @@ void handle_command(const std::string& raw_input) {
 			return;
 		}
 
-		// 1. СНАЧАЛА получаем STUN (пока никто не перехватывает пакеты)
+		display_message("System", "Initializing audio engine...", 3);
+		init_voice_rx();
+
 		display_message("System", "Resolving public IP via STUN...", 3);
 		std::string my_id = get_ext_addr_via_stun(global_sock);
 
@@ -316,15 +431,14 @@ void handle_command(const std::string& raw_input) {
 			}
 		}
 
-		// 2. ТЕПЕРЬ запускаем слушающие потоки
 		listening.store(true);
 		std::thread(udp_listen_loop).detach();
 		std::thread(check_timeout).detach();
 		std::thread(heartbeat_loop).detach();
 		
-		// 3. UPnP запускаем в фоне, чтобы не морозить интерфейс ncurses
 		active_upnp_port.store(port);
 		std::thread(setup_upnp, port).detach();
+		std::thread(voice_capture_thread).detach();
 
 		display_message("System", "Listening on port " + arg1, 3);
 		display_message("System", "YOUR PUBLIC ID: " + my_id, 3);
@@ -338,19 +452,65 @@ void handle_command(const std::string& raw_input) {
 			return;
 		}
 		std::thread(punch_and_connect, arg1, std::stoi(arg2)).detach();
+	} else if (cmd == "/vc") {
+		my_voice_on = !my_voice_on.load();
+
+		if (!my_voice_on.load()) {
+			if (pa_playback) {
+				int err;
+				pa_simple_flush(pa_playback, &err);
+			}
+		}
+
+		unsigned char notify[2] = {0x03, (unsigned char)(my_voice_on ? 1 : 0)};
+		if (connected.load()) {
+			sendto(global_sock, notify, 2, 0, (struct sockaddr*)&remote_peer_addr, sizeof(remote_peer_addr));
+		}
+
+		display_message("System", my_voice_on ? "Voice chat ENABLED" : "Voice chat DISABLED", 3);
+		refresh_status_bar();
 	} else {
 		display_message("System", "Unknown command or not connected.", 3);
 	}
 }
 
+void rebuild_ui(const std::string& current_input) {
+    std::lock_guard<std::mutex> lock(ui_mutex);
+    
+    getmaxyx(stdscr, max_y, max_x);
+    
+    int input_content_len = current_input.length() + 2; 
+    int input_height = (input_content_len / (max_x - 2)) + 3;
+    if (input_height > 10) input_height = 10;
+
+    if (chat_bg) { delwin(chat_text); delwin(chat_bg); }
+    if (input_bg) { delwin(input_text); delwin(input_bg); }
+
+    chat_bg = newwin(max_y - input_height, max_x, 0, 0);
+    input_bg = newwin(input_height, max_x, max_y - input_height, 0);
+    
+    chat_text = derwin(chat_bg, max_y - input_height - 2, max_x - 2, 1, 1);
+    input_text = derwin(input_bg, input_height - 2, max_x - 2, 1, 1);
+
+    scrollok(chat_text, TRUE);
+    box(chat_bg, 0, 0);
+    box(input_bg, 0, 0);
+    
+    refresh();
+    wnoutrefresh(chat_bg);
+    wnoutrefresh(input_bg);
+    doupdate();
+}
+
 void start_gui() {
 	initscr();
+	raw();
+	noecho();
 	start_color();
 	init_pair(1, COLOR_RED, COLOR_BLACK);   
 	init_pair(2, COLOR_MAGENTA, COLOR_BLACK); 
 	init_pair(3, COLOR_CYAN, COLOR_BLACK);    
 
-	int max_y, max_x;
 	getmaxyx(stdscr, max_y, max_x);
 
 	chat_bg = newwin(max_y - 3, max_x, 0, 0);
@@ -368,45 +528,78 @@ void start_gui() {
     display_message("System", "Welcome! Use /listen <port> to start.", 3);
 
     std::string current_input = "";
-    while (true) {
-        int ch = wgetch(input_text);
+	while (true) {
+		int ch = wgetch(input_text);
 
-        if (ch != ERR) {
-            if (ch == '\n') {
-                if (current_input == "/quit") break;
-                
-                if (current_input.find("/") == 0) {
-                    handle_command(current_input);
-                } else if (!current_input.empty()) {
-                    if (connected.load()) {
-                        sendto(global_sock, current_input.c_str(), current_input.length(), 0, 
-                               (struct sockaddr*)&remote_peer_addr, sizeof(remote_peer_addr));
-                        display_message("You", current_input, 2);
-                    } else {
-                        display_message("System", "Not connected.", 3);
-                    }
-                }
-                current_input.clear();
-                wclear(input_text);
-            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
-                if (!current_input.empty()) current_input.pop_back();
-            } else if (isprint(ch)) {
-                current_input += (char)ch;
-            }
+		if (ch == KEY_RESIZE) {
+			rebuild_ui(current_input);
+			continue;
+		}
 
-            wclear(input_text);
-            mvwprintw(input_text, 0, 0, "> %s", current_input.c_str());
-            wrefresh(input_text);
-        }
+		if (ch != ERR) {
+			bool input_changed = false;
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+			if (ch == '\n') {
+				if (current_input == "/quit") {
+					break;
+				}
+				else if (current_input.find("/") == 0) {
+					handle_command(current_input);
+				}
+				else if (!current_input.empty()) {
+					if (connected.load()) {
+						std::string packet;
+						packet += (char)0x01;
+						packet += current_input;
+						sendto(global_sock, packet.c_str(), packet.length(), 0, 
+								(struct sockaddr*)&remote_peer_addr, sizeof(remote_peer_addr));
+						display_message("You", current_input, 2);
+					} else {
+						display_message("System", "Not connected.", 3);
+					}
+				}
+
+				current_input.clear();
+				input_changed = true;
+			}
+			else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+				if (!current_input.empty()) {
+					current_input.pop_back();
+					input_changed = true;
+				}
+			} 
+			else if (ch < 0x100 && isprint(ch)) {
+				current_input += (char)ch;
+				input_changed = true;
+			}
+
+			if (input_changed) {
+				int needed_h = (current_input.length() / (max_x - 2)) + 3;
+				if (needed_h != getmaxy(input_bg)) {
+					rebuild_ui(current_input);
+				}
+
+				wclear(input_text);
+				mvwprintw(input_text, 0, 0, "> %s", current_input.c_str());
+				wrefresh(input_text);
+			}
+		}
+
+		static auto last_ui_update = std::chrono::steady_clock::now();
+		if (std::chrono::steady_clock::now() - last_ui_update > std::chrono::milliseconds(500)) {
+			refresh_status_bar();
+			last_ui_update = std::chrono::steady_clock::now();
+		}
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
     endwin();
 }
 
 int main() {
 	start_gui();
 	cleanup_upnp();
+	if (pa_playback) pa_simple_free(pa_playback);
 	if (global_sock != -1) close(global_sock);
 	return 0;
 }
