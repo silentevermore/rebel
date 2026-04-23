@@ -2,6 +2,9 @@
 #define FRAME_SIZE 960 // 20ms при 48kHz
 #define CHANNELS 1
 
+#include <queue>
+#include <vector>
+#include <condition_variable>
 #include <cassert>
 #include <iostream>
 #include <string>
@@ -41,6 +44,7 @@ std::atomic<bool> listening{false};
 std::atomic<std::chrono::steady_clock::time_point> last_seen;
 
 std::atomic<bool> my_voice_on{false};
+std::string my_nick = "Anon";
 std::atomic<bool> peer_voice_on{false};
 
 std::atomic<int> max_x{0};
@@ -49,6 +53,11 @@ std::atomic<int> max_y{0};
 struct sockaddr_in remote_peer_addr;
 int global_sock = -1;
 std::atomic<int> active_upnp_port{-1};
+
+std::queue<std::vector<unsigned char>> audio_queue;
+std::mutex audio_queue_mutex;
+std::condition_variable audio_queue_cv;
+const size_t MAX_AUDIO_QUEUE_SIZE = 15;
 
 WINDOW *chat_bg, *chat_text, *input_bg, *input_text;
 std::mutex ui_mutex;
@@ -66,10 +75,10 @@ void init_voice_rx() {
 	ss.rate = SAMPLE_RATE;
 
 	pa_buffer_attr attr;
-	attr.maxlength = (uint32_t)-1;
+	attr.maxlength = pa_usec_to_bytes(50 * 1000, &ss);
 	attr.tlength = pa_usec_to_bytes(20 * 1000, &ss);
-	attr.prebuf = (uint32_t)-1;
-	attr.minreq = (uint32_t)-1;
+	attr.prebuf = 0;
+	attr.minreq = pa_usec_to_bytes(10 * 1000, &ss);
 	attr.fragsize = pa_usec_to_bytes(20 * 1000, &ss);
 
     int error;
@@ -88,10 +97,10 @@ void voice_capture_thread() {
 	ss.rate = SAMPLE_RATE;
 
 	pa_buffer_attr attr;
-	attr.maxlength = (uint32_t)-1;
+	attr.maxlength = pa_usec_to_bytes(50 * 1000, &ss);
 	attr.tlength = pa_usec_to_bytes(20 * 1000, &ss);
-	attr.prebuf = (uint32_t)-1;
-	attr.minreq = (uint32_t)-1;
+	attr.prebuf = 0;
+	attr.minreq = pa_usec_to_bytes(10 * 1000, &ss);
 	attr.fragsize = pa_usec_to_bytes(20 * 1000, &ss);
 
     int error;
@@ -117,6 +126,34 @@ void voice_capture_thread() {
         }
     }
     if (pa_capture) pa_simple_free(pa_capture);
+}
+
+void voice_playback_thread() {
+    while (listening.load()) {
+        std::vector<unsigned char> packet;
+        {
+            std::unique_lock<std::mutex> lock(audio_queue_mutex);
+            audio_queue_cv.wait_for(lock, std::chrono::milliseconds(100), []{ 
+                return !audio_queue.empty() || !listening.load(); 
+            });
+
+            if (!listening.load()) break;
+            if (audio_queue.empty()) continue;
+
+            packet = audio_queue.front();
+            audio_queue.pop();
+        }
+
+        if (peer_voice_on.load() && opus_decoder && pa_playback) {
+            int16_t out_pcm[FRAME_SIZE];
+            int samples = opus_decode(opus_decoder, packet.data(), packet.size(), out_pcm, FRAME_SIZE, 0);
+            
+            if (samples > 0) {
+                int pa_err;
+                pa_simple_write(pa_playback, out_pcm, samples * sizeof(int16_t), &pa_err);
+            }
+        }
+    }
 }
 
 void cleanup_upnp() {
@@ -322,19 +359,30 @@ void udp_listen_loop() {
             last_seen.store(std::chrono::steady_clock::now());
             unsigned char type = buffer[0];
             
-            if (type == 0x01) {
-                display_message("Friend", std::string(buffer + 1, n - 1), 1);
-                continue; 
-            } 
-            else if (type == 0x02) {
+			if (type == 0x01) {
+				std::string payload(buffer + 1, n - 1);
+				size_t delim = payload.find('\x1F');
+
+				if (delim != std::string::npos) {
+					std::string peer_nick = payload.substr(0, delim);
+					std::string text = payload.substr(delim + 1);
+					display_message(peer_nick, text, 1);
+				} else {
+					display_message("Friend", payload, 1);
+				}
+				continue; 
+			} else if (type == 0x02) {
                 if (peer_voice_on.load() && opus_decoder && pa_playback) {
-                    int16_t out_pcm[FRAME_SIZE];
-                    int samples = opus_decode(opus_decoder, (unsigned char*)buffer + 1, n - 1, out_pcm, FRAME_SIZE, 0);
-                    if (samples > 0) {
-                        int pa_err;
-                        pa_simple_write(pa_playback, out_pcm, samples * sizeof(int16_t), &pa_err);
-                    }
-                }
+					std::vector<unsigned char> audio_data((unsigned char*)buffer + 1, (unsigned char*)buffer + n);
+
+					{
+						std::lock_guard<std::mutex> lock(audio_queue_mutex);
+						if (audio_queue.size() >= MAX_AUDIO_QUEUE_SIZE) {
+							audio_queue.pop(); 
+						}
+						audio_queue.push(audio_data);
+					}
+					audio_queue_cv.notify_one();}
                 continue;
             } else if (type == 0x03) {
 				bool voice_state = (buffer[1] == 1);
@@ -354,8 +402,7 @@ void udp_listen_loop() {
 				continue;
 			} else if (msg == "KEEPALIVE_PONG") {
 				continue;
-			} 
-            else if (msg.find("PUNCH:") == 0) {
+			} else if (msg.find("PUNCH:") == 0) {
                 if (msg.substr(6) == SECRET_KEY) {
                     remote_peer_addr = src_addr;
                     if (!connected.load()) {
@@ -365,16 +412,20 @@ void udp_listen_loop() {
                     }
                 }
 				continue;
-            } 
-            else if (msg == "PUNCH_ACK") {
+            } else if (msg == "PUNCH_ACK") {
                 remote_peer_addr = src_addr;
                 if (!connected.load()) {
                     connected.store(true);
                     display_message("System", "Handshake ACK! Connected.", 3);
                 }
 				continue;
-            }
-            else if (connected.load() && type > 0x1F) { 
+			} else if (msg.find("DISCOVER:") == 0) {
+				std::string peer_port = msg.substr(9);
+				std::string peer_ip = inet_ntoa(src_addr.sin_addr);
+				display_message("System", "Found peer on LAN! IP: " + peer_ip + ":" + peer_port, 3);
+				// При желании можно тут же вызвать punch_and_connect(peer_ip, std::stoi(peer_port));
+				continue;
+			} else if (connected.load() && type > 0x1F) { 
                 display_message("Friend", msg, 1); 
             }   
         }
@@ -450,6 +501,7 @@ void handle_command(const std::string& raw_input) {
 		active_upnp_port.store(port);
 		std::thread(setup_upnp, port).detach();
 		std::thread(voice_capture_thread).detach();
+		std::thread(voice_playback_thread).detach();
 
 		display_message("System", "Listening on port " + arg1, 3);
 		display_message("System", "YOUR PUBLIC ID: " + my_id, 3);
@@ -480,7 +532,38 @@ void handle_command(const std::string& raw_input) {
 
 		display_message("System", my_voice_on ? "Voice chat ENABLED" : "Voice chat DISABLED", 3);
 		refresh_status_bar();
-	} else {
+	} else if (cmd == "/nick") {
+		if (arg1.empty()) {
+			display_message("System", "Usage: /nick <name>", 3);
+			return;
+		}
+		my_nick = arg1;
+		display_message("System", "Nickname changed to " + my_nick, 3);
+	}
+	else if (cmd == "/scan") {
+		if (arg1.empty()) {
+			display_message("System", "Usage: /scan <port>", 3);
+			return;
+		}
+		int scan_port = std::stoi(arg1);
+		int bsock = socket(AF_INET, SOCK_DGRAM, 0);
+
+		int broadcastEnable = 1;
+		setsockopt(bsock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+
+		struct sockaddr_in baddr;
+		memset(&baddr, 0, sizeof(baddr));
+		baddr.sin_family = AF_INET;
+		baddr.sin_port = htons(scan_port);
+		baddr.sin_addr.s_addr = inet_addr("255.255.255.255");
+
+		std::string msg = "DISCOVER:" + std::to_string(active_upnp_port.load());
+		sendto(bsock, msg.c_str(), msg.length(), 0, (struct sockaddr*)&baddr, sizeof(baddr));
+
+		close(bsock);
+		display_message("System", "Scanning LAN on port " + arg1 + "...", 3);
+	}
+	else {
 		display_message("System", "Unknown command or not connected.", 3);
 	}
 }
@@ -561,7 +644,7 @@ void start_gui() {
 					if (connected.load()) {
 						std::string packet;
 						packet += (char)0x01;
-						packet += current_input;
+						packet += my_nick + "\x1F" + current_input;
 						sendto(global_sock, packet.c_str(), packet.length(), 0, 
 								(struct sockaddr*)&remote_peer_addr, sizeof(remote_peer_addr));
 						display_message("You", current_input, 2);
